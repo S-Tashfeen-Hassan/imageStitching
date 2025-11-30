@@ -4,6 +4,7 @@ import numpy as np
 import argparse
 import sys
 from matchers import Matchers
+from datetime import datetime
 
 
 def resolve_paths(list_file):
@@ -51,25 +52,36 @@ class Stitcher:
 
     def accumulate_to_center(self, Hs):
         n = len(self.images)
-        center = n // 2
+        
+        # FIX: If we only have 2 images, anchor the LEFT one (0) 
+        # to avoid using the unstable inverse matrix.
+        if n == 2:
+            center = 0
+        else:
+            center = n // 2
+
         transforms = [None] * n
         transforms[center] = np.eye(3)
 
+        # 1. Propagate to the Left (requires Inverse)
         for i in range(center - 1, -1, -1):
             H_forward = Hs[i]
             if H_forward is None:
                 transforms[i] = None
                 continue
             try:
+                # Inverting matrices is risky, but necessary for left-side images
                 H_inv = np.linalg.inv(H_forward)
             except np.linalg.LinAlgError:
                 transforms[i] = None
                 continue
+            
             if transforms[i+1] is None:
                 transforms[i] = None
             else:
                 transforms[i] = transforms[i+1] @ H_inv
 
+        # 2. Propagate to the Right (uses Direct matrix - More Stable)
         for i in range(center + 1, n):
             H = Hs[i-1]
             if H is None or transforms[i-1] is None:
@@ -207,6 +219,21 @@ def clean_edges(img):
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
     coords = cv2.findNonZero(gray)
     x, y, w, h = cv2.boundingRect(coords)
+
+    # --- ADD THIS BLOCK ---
+    margin = 20  # <--- Change this number to crop more or less pixels
+    
+    x = x + margin
+    y = y + margin
+    w = w - (2 * margin) # Subtract margin from both Left AND Right
+    h = h - (2 * margin) # Subtract margin from both Top AND Bottom
+    
+    # Safety check: prevent crashing if margin is too big
+    if w <= 0 or h <= 0:
+        print("Margin too big! Returning original.")
+        x, y, w, h = cv2.boundingRect(coords) # Reset
+    # ----------------------
+
     crop = img[y:y+h, x:x+w]
     
     # 2. Identify "dull" edge noise
@@ -225,7 +252,7 @@ def clean_edges(img):
     # 4. Inpaint with Navier-Stokes (NS)
     # INCREASED RADIUS: 3 -> 5
     # Helps blend the stronger correction smoothly.
-    print(f"Cleaning edge artifacts (Aggressive: Thresh=30, Iter=2)...")
+    print(f"Cleaning edge artifacts (Thresh=5, Iter=2)...")
     cleaned = cv2.inpaint(crop, mask_dilated, 5, cv2.INPAINT_NS)
     
     return cleaned
@@ -237,6 +264,9 @@ if __name__ == '__main__':
     parser.add_argument('--out', type=str, default='stitched_output.jpg', help='output filename')
     args = parser.parse_args()
 
+    # Generate a unique ID for this specific run (YearMonthDay_HourMinuteSecond)
+    run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
+
     paths = resolve_paths(args.list_file)
     print('Resolved paths:')
     for p in paths:
@@ -244,30 +274,65 @@ if __name__ == '__main__':
 
     imgs, failed = load_images(paths, resize=args.resize if args.resize and args.resize>0 else None)
     
+    # Filter valid paths
+    valid_paths = [p for p in paths if p not in failed]
+
     if len(imgs) < 2:
         print('Not enough valid images. Exiting.')
         sys.exit(1)
 
+    # --- SETUP OUTPUT DIRECTORIES ---
+    base_dir = "processing_steps"
+    step1_dir = os.path.join(base_dir, "1_cylindrical_warp")
+    step2_dir = os.path.join(base_dir, "2_raw_stitch")
+    step3_dir = os.path.join(base_dir, "3_cleaned_output")
+    
+    os.makedirs(step1_dir, exist_ok=True)
+    os.makedirs(step2_dir, exist_ok=True)
+    os.makedirs(step3_dir, exist_ok=True)
+    print(f"Intermediate outputs will be saved to '{base_dir}/' folder.")
+
     # 1. APPLY CYLINDRICAL WARP
-    print("Applying Cylindrical Warp to images...")
-    # Estimate focal length as the width of the image
+    print("Step 1: Applying Cylindrical Warp...")
     focal_length = imgs[0].shape[1] 
     
     cylindrical_imgs = []
-    for img in imgs:
+    for i, img in enumerate(imgs):
         warped_img = cylindrical_warp(img, focal_length)
         cylindrical_imgs.append(warped_img)
         
+        # Uniquely name the warped parts based on original filename
+        original_name = os.path.basename(valid_paths[i])
+        name_no_ext = os.path.splitext(original_name)[0]
+        # We also append the run_id here so you can compare different runs if needed
+        save_path = os.path.join(step1_dir, f"{name_no_ext}_warped_{run_id}.jpg")
+        cv2.imwrite(save_path, warped_img)
+        
     imgs = cylindrical_imgs
+    print(f"  - Warped images saved to {step1_dir}")
 
     # 2. STITCH
+    print("Step 2: Stitching images...")
     matcher = Matchers()
     stitcher = Stitcher(imgs, matcher)
     final_pano = stitcher.stitch()
+    
+    # Save raw stitch with unique Timestamp
+    raw_name = f"raw_panorama_{run_id}.jpg"
+    raw_pano_path = os.path.join(step2_dir, raw_name)
+    cv2.imwrite(raw_pano_path, final_pano)
+    print(f"  - Raw stitch saved as: {raw_name}")
 
-    # --- REPLACE THE PREVIOUS CROP LOGIC WITH THIS ---
-    print("Maximizing image area with inpainting...")
+    # 3. CLEAN EDGES
+    print("Step 3: Maximizing image area (Cleaning Edges)...")
     final_output = clean_edges(final_pano)
     
+    # Save cleaned output with unique Timestamp
+    clean_name = f"final_clean_{run_id}.jpg"
+    clean_path = os.path.join(step3_dir, clean_name)
+    cv2.imwrite(clean_path, final_output)
+    print(f"  - Cleaned panorama saved as: {clean_name}")
+
+    # Save to the user requested argument path (this one still overwrites as intended)
     cv2.imwrite(args.out, final_output)
-    print('Saved panorama to', args.out)
+    print(f'\nProcess Complete. Final result saved to: {args.out}')

@@ -1,3 +1,6 @@
-../../images/7.jpg
-../../images/8.jpg
-../../images/9.jpg
+../../images/S1.jpg
+../../images/S2.jpg
+../../images/S3.jpg
+../../images/S5.jpg
+../../images/S6.jpg
+

@@ -1,3 +1,5 @@
-../images/1Hill.JPG
-../images/2Hill.JPG
-../images/3Hill.JPG
+../../images/F1.png
+../../images/F2.png
+../../images/F3.png
+
+
